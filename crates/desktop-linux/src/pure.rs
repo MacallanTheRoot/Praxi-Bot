@@ -717,3 +717,193 @@ mod tests {
         assert_eq!(bgra24, vec![10, 20, 30, 255, 40, 50, 60, 255]);
     }
 }
+
+#[cfg(test)]
+mod key_properties {
+    use proptest::collection::vec;
+    use proptest::prelude::*;
+    use proptest::sample::select;
+    use proptest::test_runner::RngSeed;
+
+    use super::{Key, parse_key};
+
+    const NAMED_KEYS: &[&str] = &[
+        "enter",
+        "return",
+        "tab",
+        "esc",
+        "escape",
+        "space",
+        "backspace",
+        "delete",
+        "del",
+        "insert",
+        "ins",
+        "home",
+        "end",
+        "pageup",
+        "pgup",
+        "pagedown",
+        "pgdn",
+        "left",
+        "up",
+        "right",
+        "down",
+    ];
+    // Modifier spellings accepted by desktop-windows/src/pure.rs::parse_key.
+    const WINDOWS_MODIFIERS: &[&str] = &[
+        "ctrl", "control", "lctrl", "rctrl", "shift", "lshift", "rshift", "alt", "menu", "option",
+        "lalt", "ralt", "altgr", "win", "windows", "cmd", "meta", "super", "lwin", "rwin",
+        "rsuper",
+    ];
+    const WHITESPACE: &[&str] = &["", " ", "\t", "\r\n", "\u{a0}", "\t\u{2003} "];
+
+    fn unicode_text() -> impl Strategy<Value = String> {
+        const EDGE_CHARS: &[char] = &['\0', '\t', '\n', '\u{1b}', '\u{2003}', 'İ', '\u{307}', '🦀'];
+        let character = prop_oneof![4 => any::<char>(), 1 => select(EDGE_CHARS)];
+        vec(character, 0..=512).prop_map(|chars| chars.into_iter().collect())
+    }
+
+    fn vary_ascii_case(name: &str, uppercase: &[bool; 16]) -> String {
+        name.chars()
+            .zip(uppercase.iter().cycle())
+            .map(|(c, &upper)| if upper { c.to_ascii_uppercase() } else { c })
+            .collect()
+    }
+
+    fn config() -> ProptestConfig {
+        // Keep proptest's 256-case default and its environment overrides.
+        let mut config = ProptestConfig::default();
+        if config.rng_seed == RngSeed::Random {
+            config.rng_seed = RngSeed::Fixed(461);
+        }
+        config
+    }
+
+    proptest! {
+        #![proptest_config(config())]
+
+        /// Arbitrary valid UTF-8, including controls and unusual Unicode, never panics.
+        #[test]
+        fn arbitrary_utf8_does_not_panic(input in unicode_text()) {
+            let _ = parse_key(&input);
+        }
+
+        /// Recognized ASCII key names keep the same keysym across case and surrounding whitespace.
+        #[test]
+        fn named_keys_ignore_ascii_case_and_whitespace(
+            uppercase in any::<[bool; 16]>(),
+            before in select(WHITESPACE),
+            after in select(WHITESPACE),
+        ) {
+            for &name in NAMED_KEYS.iter().chain(WINDOWS_MODIFIERS) {
+                let expected = parse_key(name);
+                let varied = vary_ascii_case(name, &uppercase);
+                let input = format!("{before}{varied}{after}");
+                prop_assert!(matches!(expected, Some(Key::Keysym(_))), "{name:?}");
+                prop_assert_eq!(parse_key(&input), expected, "input: {:?}", input);
+            }
+        }
+
+        /// Linux recognizes every Windows modifier spelling as a named key.
+        #[test]
+        fn windows_modifier_names_are_recognized(uppercase in any::<[bool; 16]>()) {
+            for &name in WINDOWS_MODIFIERS {
+                let input = vary_ascii_case(name, &uppercase);
+                prop_assert!(matches!(parse_key(&input), Some(Key::Keysym(_))), "{input:?}");
+            }
+        }
+
+        /// F1 through F24 map to the X11 keysyms in keysymdef.h, and out-of-range numbers are rejected.
+        #[test]
+        fn function_key_range(
+            prefix in select(&['f', 'F'][..]),
+            leading_zeroes in 0..=3_usize,
+            invalid in prop_oneof![Just(0), 25..=64_u64, 65..=u64::MAX],
+        ) {
+            let zeroes = "0".repeat(leading_zeroes);
+            for (number, sym) in (1..=24).zip(0xFFBE..=0xFFD5) {
+                let input = format!("{prefix}{zeroes}{number}");
+                prop_assert_eq!(parse_key(&input), Some(Key::Keysym(sym)), "input: {:?}", input);
+            }
+            let input = format!("{prefix}{zeroes}{invalid}");
+            prop_assert_eq!(parse_key(&input), None, "input: {:?}", input);
+        }
+
+        /// ASCII letters use their lowercase X11 keysyms, and digits use their ASCII values.
+        #[test]
+        fn ascii_letters_and_digits(letter in b'a'..=b'z', digit in b'0'..=b'9') {
+            for byte in [letter, letter.to_ascii_uppercase(), digit] {
+                let input = char::from(byte).to_string();
+                let sym = u32::from(byte.to_ascii_lowercase());
+                prop_assert_eq!(parse_key(&input), Some(Key::Keysym(sym)), "input: {:?}", input);
+            }
+        }
+
+        /// A single untrimmed non-ASCII literal with no named mapping retains its original scalar.
+        #[test]
+        fn unicode_literals_keep_the_original_character(
+            c in any::<char>().prop_filter("non-ASCII literal", |c| !c.is_ascii() && !c.is_whitespace()),
+            before in select(WHITESPACE),
+            after in select(WHITESPACE),
+        ) {
+            // Literal characters come from the original spelling after the named-key lookup.
+            let input = format!("{before}{c}{after}");
+            prop_assert_eq!(parse_key(&input), Some(Key::Char(c)), "input: {:?}", input);
+        }
+
+        /// Unknown tokens with at least two characters after trimming are rejected.
+        #[test]
+        fn unknown_multi_character_tokens_are_rejected(text in unicode_text()) {
+            let input = format!(" \t?{text}!\u{2003}");
+            prop_assert_eq!(parse_key(&input), None, "input: {:?}", input);
+        }
+    }
+
+    /// Function key boundaries and oversized numeric suffixes are handled safely.
+    #[test]
+    fn function_key_boundaries_and_overflow() {
+        assert_eq!(parse_key("F0"), None);
+        assert_eq!(parse_key("F1"), Some(Key::Keysym(0xFFBE)));
+        assert_eq!(parse_key("F24"), Some(Key::Keysym(0xFFD5)));
+        assert_eq!(parse_key("F25"), None);
+        assert_eq!(parse_key("F4294967296"), None);
+        assert_eq!(parse_key(&format!("F{}", "9".repeat(8192))), None);
+        assert_eq!(
+            parse_key(&format!("F{}1", "0".repeat(8192))),
+            Some(Key::Keysym(0xFFBE))
+        );
+    }
+
+    /// The named space token yields a keysym, while literal fallback requires one non-whitespace scalar.
+    #[test]
+    fn whitespace_and_literal_regressions() {
+        assert_eq!(parse_key(" \tSpAcE\u{2003}"), Some(Key::Keysym(0x0020)));
+        for input in ["", " ", "\t\r\n\u{2003}", "e\u{301}", "ctrl\0", "a\0b"] {
+            assert_eq!(parse_key(input), None, "{input:?}");
+        }
+        for c in ['İ', 'ı', 'ş', '\u{212a}', '🦀', '\u{301}', '\u{1b}', '\0'] {
+            assert_eq!(parse_key(&c.to_string()), Some(Key::Char(c)), "{c:?}");
+        }
+        assert_eq!(parse_key(&"İ\u{301}🦀\0".repeat(4096)), None);
+    }
+
+    /// Left and right modifier aliases retain the corresponding X11 keysyms.
+    #[test]
+    fn sided_modifier_aliases() {
+        for (name, sym) in [
+            ("lctrl", 0xFFE3),
+            ("rctrl", 0xFFE4),
+            ("lshift", 0xFFE1),
+            ("rshift", 0xFFE2),
+            ("lalt", 0xFFE9),
+            ("ralt", 0xFFEA),
+            ("altgr", 0xFFEA),
+            ("lwin", 0xFFEB),
+            ("rwin", 0xFFEC),
+            ("rsuper", 0xFFEC),
+        ] {
+            assert_eq!(parse_key(name), Some(Key::Keysym(sym)), "{name}");
+        }
+    }
+}
