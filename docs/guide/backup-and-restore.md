@@ -99,7 +99,7 @@ The first line names where `bot` keeps secrets; it can differ on your system.
 
 ## JSON output for scripts
 
-Use the global `--json` flag to get one JSON object on stdout after a successful command.
+Use the global `--json` flag to get one JSON object on stdout after a successful command. Notices such as `(secret backend: ...)` go to stderr, so stdout can be parsed as it is.
 
 ```sh
 bot --json backup ./praxi-backup.tar
