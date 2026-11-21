@@ -1,8 +1,11 @@
 //! Inspect the English/Turkish schedule parser without creating a schedule or running a daemon.
 //!
 //! From the workspace root:
+//!
+//! ```sh
 //! cargo run -p scheduler --example parse_schedule -- "every weekday at 8:15am" "in 30 minutes"
 //! cargo run -p scheduler --example parse_schedule -- --tz Europe/Istanbul "her gün 09:00"
+//! ```
 
 use std::env;
 use std::process;
